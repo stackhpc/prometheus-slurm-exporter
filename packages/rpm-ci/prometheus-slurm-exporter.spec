@@ -11,7 +11,7 @@ Group:          Monitoring
 License:        GPL 3.0
 URL:            https://github.com/stackhpc/prometheus-slurm-exporter
 
-Source0:        https://github.com/stackhpc/prometheus-slurm-exporter/archive/refs/tags/%{version}.tar.gz
+Source0:        %{version}.tar.gz
 Source1:        %{name}.service
 Source2:        LICENSE
 Source3:        README.md

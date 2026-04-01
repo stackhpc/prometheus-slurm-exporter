@@ -1,63 +1,164 @@
 name: Release Prometheus Slurm Exporter RPM
 
 on:
+  push:
+    branches: ["*"]
+    tags: ["*"]
   workflow_dispatch:
     inputs:
       release-tag:
         type: string
         description: Tag to release (e.g. 0.20)
         required: true
+
 jobs:
   build-rocky-rpms:
     runs-on: ubuntu-latest
-    container:
-      image: rockylinux:8.8
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            rpm_arch: x86_64
+          - arch: arm64
+            platform: linux/arm64
+            rpm_arch: aarch64
 
-    # Required to upload the built RPM to the release
     permissions:
       contents: write
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          ref: "${{ github.event.inputs.release-tag }}"
+          ref: "${{ github.event.inputs.release-tag || github.ref }}"
           fetch-depth: 0
 
-      - name: Install Prerequisites
-        run: dnf install -y rpm-build rpmdevtools make git go jq curl
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.release-tag }}"
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/ ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      # Query GitHub API for assets under the specified release-tag
+      - name: Set up QEMU for cross-platform builds
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Generate release number
         id: release
         run: |
-          RELEASE=$(curl -fSsL https://api.github.com/repos/${{ github.repository }}/releases |\
-          jq '.[] | select(.name == "${{ github.event.inputs.release-tag }}") | [.assets[].name | select(test(".*\\.rpm$"))] | length' |\
-          .github/scripts/generate_release.sh)
-          echo "::set-output name=release::$RELEASE"
+          if [[ "${{ github.ref }}" =~ ^refs/tags/ ]] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE=$(curl -fSsL https://api.github.com/repos/${{ github.repository }}/releases | \
+            jq '.[] | select(.name == "${{ steps.version.outputs.version }}") | [.assets[].name | select(test(".*\\.rpm$"))] | length' | \
+            .github/scripts/generate_release.sh)
+          else
+            RELEASE="1"
+          fi
+          echo "release=$RELEASE" >> $GITHUB_OUTPUT
 
-      - name: Prepare RPMBUILD Environment
+      - name: Build RPM in Rocky Linux container
         run: |
-          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,tmp} &&
-          echo '%_topdir %(echo $HOME)/rpmbuild' > ~/.rpmmacros &&
-          cp README.md ~/rpmbuild/SOURCES &&
-          cp LICENSE ~/rpmbuild/SOURCES &&
-          cp lib/systemd/prometheus-slurm-exporter.service ~/rpmbuild/SOURCES &&
-          cp packages/rpm-ci/*.spec ~/rpmbuild/SPECS
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            rockylinux:9.3 \
+            bash -c "
+              set -ex
+              
+              # Install Prerequisites
+              dnf install -y --allowerasing rpm-build rpmdevtools make git go jq curl tar systemd
+              
+              # Prepare RPMBUILD Environment
+              mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,tmp}
+              echo '%_topdir %(echo \$HOME)/rpmbuild' > ~/.rpmmacros
+              
+              # Create source tarball with proper directory structure
+              cd /tmp
+              cp -r /workspace prometheus-slurm-exporter-${{ steps.version.outputs.version }}
+              tar --exclude='.git' --exclude='RPMS' \
+                  -czf ~/rpmbuild/SOURCES/${{ steps.version.outputs.version }}.tar.gz \
+                  prometheus-slurm-exporter-${{ steps.version.outputs.version }}
+              
+              # Copy other sources
+              cp /workspace/README.md ~/rpmbuild/SOURCES
+              cp /workspace/LICENSE ~/rpmbuild/SOURCES
+              cp /workspace/lib/systemd/prometheus-slurm-exporter.service ~/rpmbuild/SOURCES
+              cp /workspace/packages/rpm-ci/*.spec ~/rpmbuild/SPECS
+              
+              # Build RPM
+              cd ~/rpmbuild
+              rpmbuild -bb \
+                --define '_release ${{ steps.release.outputs.release }}' \
+                --define '_version ${{ steps.version.outputs.version }}' \
+                --define '_arch ${{ matrix.rpm_arch }}' \
+                SPECS/prometheus-slurm-exporter.spec
+              
+              # Copy built RPMs to workspace
+              mkdir -p /workspace/RPMS/${{ matrix.arch }}
+              cp ~/rpmbuild/RPMS/*/*.rpm /workspace/RPMS/${{ matrix.arch }}/
+            "
 
-      - name: Build RPM
+      - name: List built packages
         run: |
-          cd ~/rpmbuild || exit 1
-          spectool -g -R --define '_release ${{ steps.release.outputs.release }}' --define '_version ${{ github.event.inputs.release-tag }}' SPECS/prometheus-slurm-exporter.spec
-          rpmbuild -bb --define '_release ${{ steps.release.outputs.release }}' --define '_version ${{ github.event.inputs.release-tag }}' SPECS/prometheus-slurm-exporter.spec
+          echo "Built packages for ${{ matrix.arch }}:"
+          ls -la RPMS/${{ matrix.arch }}/
 
-      - name: Move RPM
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-packages-${{ matrix.arch }}
+          path: RPMS/${{ matrix.arch }}/*.rpm
+
+  release:
+    name: Create Release
+    needs: build-rocky-rpms
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine version
+        id: version
         run: |
-          mkdir -p RPMS
-          cp ~/rpmbuild/RPMS/*/*.rpm RPMS/
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.release-tag }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release/
+          cp artifacts/rpm-packages-*/*.rpm release/
+
+          # Create checksums
+          cd release/
+          sha256sum *.rpm > checksums.txt
 
       - name: Release RPM
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
-          tag_name: "${{ github.event.inputs.release-tag }}"
-          files: "RPMS/*"
+          tag_name: "${{ steps.version.outputs.version }}"
+          files: |
+            release/*.rpm
+            release/checksums.txt
